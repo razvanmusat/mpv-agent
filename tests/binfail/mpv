@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "start" >> "$(dirname "$0")/attempts.log"
+exit 1

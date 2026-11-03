@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+# mpv fals: asculta pe socketul IPC, raspunde "success", tine minte loadfile-urile
+import sys, os, socket, json, threading
+sock = [a.split("=",1)[1] for a in sys.argv if a.startswith("--input-ipc-server=")][0]
+state = {"playlist": [], "pause": False}
+log = open(os.path.join(os.path.dirname(sock), "fake-mpv.log"), "a")
+s = socket.socket(socket.AF_UNIX); s.bind(sock); s.listen(5)
+def serve(c):
+    for line in c.makefile():
+        m = json.loads(line); cmd = m["command"]; log.write(json.dumps(cmd)+"\n"); log.flush()
+        data = None
+        if cmd[0] == "loadfile":
+            if cmd[2] == "replace": state["playlist"] = []
+            state["playlist"].append(cmd[1])
+        elif cmd[0] == "set_property": state[cmd[1]] = cmd[2]
+        elif cmd[0] == "get_property":
+            data = {"path": (state["playlist"] or [None])[0], "pause": state["pause"], "idle-active": False}.get(cmd[1])
+        c.sendall((json.dumps({"event":"noise"})+"\n"+json.dumps({"error":"success","data":data,"request_id":m["request_id"]})+"\n").encode())
+        if cmd[0] == "quit": os._exit(0)
+while True:
+    c,_ = s.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()

@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+tests/cache*/
+tests/run/*
+!tests/run/.gitkeep
+tests/binfail/attempts.log
