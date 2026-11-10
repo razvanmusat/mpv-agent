@@ -90,6 +90,7 @@ COMMANDS = {"play", "pause", "stop", "next", "party", "quick"}
 QUICK_MAX_FILES = 50
 TICK_SECONDS = 5
 RETRY_SECONDS = 5
+IDLE_RETRY_SECONDS = 30       # mpv idle cu playlist ne-gol: reia redarea cel mult odata la atat
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
 DEFAULT_IMAGE_SECONDS = 10     # pentru poze fara imageSeconds (mpv ar tine poza doar 1s)
 CONNECT_SECONDS = 5
@@ -268,7 +269,7 @@ class Player:
         sock = cfg["mpv_socket"]
         if os.path.exists(sock):
             os.unlink(sock)
-        cmd = ["mpv", "--no-config", "--idle=yes", "--vo=drm", "--loop-playlist=inf",
+        cmd = ["mpv", "--no-config", "--idle=yes", "--vo=drm", "--no-audio", "--loop-playlist=inf",
                "--no-terminal", "--input-ipc-server=" + sock]
         if cfg["drm_connector"]:
             cmd.append("--drm-connector=" + cfg["drm_connector"])
@@ -323,6 +324,8 @@ class Player:
             self.refresh_entries()
         name = self.entry_files.get(entry_id)
         text = msg.get("file_error") or "eroare necunoscuta"
+        if "no audio or video data played" in text:   # zgomot de la mpv: nu se retine, nu apare in /status si nu se logheaza
+            return
         self.error_seq += 1
         self.last_error = {"id": self.error_seq, "file": name, "message": text}
         log.error("eroare de redare (%s): %s", name or "fisier necunoscut", text)
@@ -365,6 +368,7 @@ class Agent:
         self.party_items = []       # fisierele ei: ultima versiune cunoscuta, ca sesiunea sa nu depinda de program
         self.adhoc_loading = False  # rularea rapida: se descarca fisiere care nu erau pe player
         self.adhoc_error = None     # motivul ultimului esec la descarcare
+        self.last_idle_retry = 0.0  # momentul ultimei reluari automate (time.monotonic)
         self.key = None         # tinta curenta: "none" | "default" | "party:..."
         self.playlist = []      # ce ruleaza acum, [(cale, secs)]
         self.program_path = os.path.join(cfg["cache_dir"], "program.json")
@@ -514,6 +518,21 @@ class Agent:
                 self.enforce(manual_playlist)
             else:
                 self.enforce(playlist)
+        self.recover_idle()
+
+    def recover_idle(self):
+        """mpv ruleaza dar e idle cu playlist ne-gol = nu a putut reda nimic (ex. TV oprit la pornire: fara EDID, deci
+        fara modul DRM cerut). Reia redarea la cel mult IDLE_RETRY_SECONDS, ca sa porneasca singura cand ecranul revine."""
+        if not self.playlist or self.adhoc_loading or not self.player.running():
+            return
+        if time.monotonic() - self.last_idle_retry < IDLE_RETRY_SECONDS:
+            return
+        if self.player.idle():
+            self.last_idle_retry = time.monotonic()
+            log.warning("mpv e idle cu playlist ne-gol, reiau redarea")
+            with self.lock:
+                self.player.stop()                 # repornire curata: modul DRM se alege la initializare
+                self.apply(self.playlist)
 
     def manual_after_resume(self, prog, now):
         """Dupa iesirea din pauza: in program/cu tinta activa nu mai e nimic manual; in afara programului
