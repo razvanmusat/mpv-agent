@@ -2,20 +2,35 @@
 # mpv fals: asculta pe socketul IPC, raspunde "success", tine minte loadfile-urile
 import sys, os, socket, json, threading
 sock = [a.split("=",1)[1] for a in sys.argv if a.startswith("--input-ipc-server=")][0]
-state = {"playlist": [], "pause": False}
+state = {"playlist": [], "pause": False, "idle": False}
+clients = []   # conexiunile deschise: primesc evenimentele (end-file cu eroare pentru fisierele cu "corrupt" in nume)
 log = open(os.path.join(os.path.dirname(sock), "fake-mpv.log"), "a")
 s = socket.socket(socket.AF_UNIX); s.bind(sock); s.listen(5)
 def serve(c):
+    try: serve_client(c)
+    except OSError: pass   # clientul a inchis conexiunea
+def serve_client(c):
+    clients.append(c)
     for line in c.makefile():
         m = json.loads(line); cmd = m["command"]; log.write(json.dumps(cmd)+"\n"); log.flush()
         data = None
         if cmd[0] == "loadfile":
             if cmd[2] == "replace": state["playlist"] = []
             state["playlist"].append(cmd[1])
+            state["idle"] = all("corrupt" in x for x in state["playlist"])   # toate stricate: mpv nu reia bucla, ramane idle
         elif cmd[0] == "set_property": state[cmd[1]] = cmd[2]
         elif cmd[0] == "get_property":
-            data = {"path": (state["playlist"] or [None])[0], "pause": state["pause"], "idle-active": False}.get(cmd[1])
+            pl = state["playlist"]
+            data = {"path": (pl or [None])[0], "pause": state["pause"], "idle-active": state["idle"], "playlist/count": len(pl)}.get(cmd[1])
+            if cmd[1].startswith("playlist/") and cmd[1] != "playlist/count":
+                _, n, field = cmd[1].split("/")
+                if int(n) < len(pl): data = {"id": int(n) + 1, "filename": pl[int(n)]}[field]
         c.sendall((json.dumps({"event":"noise"})+"\n"+json.dumps({"error":"success","data":data,"request_id":m["request_id"]})+"\n").encode())
+        if cmd[0] == "loadfile" and "corrupt" in cmd[1]:
+            ev = {"event":"end-file","reason":"error","playlist_entry_id":len(state["playlist"]),"file_error":"unrecognized file format"}
+            for cl in list(clients):
+                try: cl.sendall((json.dumps(ev)+"\n").encode())
+                except OSError: pass
         if cmd[0] == "quit": os._exit(0)
 while True:
     c,_ = s.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()

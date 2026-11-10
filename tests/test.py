@@ -25,6 +25,21 @@ k, it = agent.compute_target(p, D("2026-12-05 20:00"))
 ok(k=="none", "la close nu ruleaza nimic")
 k, it = agent.compute_target(p, D("2026-12-05 08:59"))
 ok(k=="none", "inainte de open nu ruleaza nimic")
+# --- petrecere fara ore (doar manuala): nu porneste singura, are id "YYYY-MM-DD #N"
+raw_m = {**raw, "parties": raw["parties"] + [
+ {"date":"2026-12-05","files":[{"file":"m1.mp4","order":1}]},
+ {"date":"2026-12-05","files":[{"file":"m2.mp4","order":1}]},
+ {"date":"2026-12-06","files":[{"file":"m3.mp4","order":1}]}]}
+pm = agent.parse_program(raw_m)
+ok([x["id"] for x in pm["parties"]] == ["2026-12-05 15:00", "2026-12-05 #1", "2026-12-05 #2", "2026-12-06 #1"], "id-uri: cu ora si fara ora, numarate pe zi")
+k, it = agent.compute_target(pm, D("2026-12-05 16:00"))
+ok(k == "party:2026-12-05 15:00" and [i["file"] for i in it] == ["p1.mp4","p2.jpg"], "petrecerea fara ore nu intra in tinta automata")
+k, it = agent.compute_target(pm, D("2026-12-06 10:00"))
+ok(k == "default", "petrecerea fara ore nu porneste singura")
+ok([i["file"] for i in agent.Agent.find_party(None, pm, "2026-12-05 #2")["files"]] == ["m2.mp4"] and agent.Agent.find_party(None, pm, "2026-12-05 #3") is None, "find_party dupa id fara ora")
+for bad in [{"date":"2026-12-05","start":"15:00","files":[{"file":"x.mp4"}]}, {"date":"2026-12-05","durationMinutes":60,"files":[{"file":"x.mp4"}]}]:
+    try: agent.parse_program({**raw, "parties":[bad]}); ok(False, "ar fi trebuit respins "+str(bad))
+    except (KeyError, TypeError, ValueError): ok(True, "respins (doar una dintre ore): "+str(bad))
 for bad in [{"file":"../etc/passwd","days":[1],"order":1}, {"file":"x.mp4","days":[9],"order":1}]:
     try: agent.parse_program({**raw, "default":[bad]}); ok(False, "ar fi trebuit respins "+str(bad))
     except ValueError: ok(True, "respins: "+str(bad))

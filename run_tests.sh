@@ -2,7 +2,7 @@
 # Ruleaza testele agentului (mpv-ul e inlocuit cu unul fals din tests/bin). Iesirea merge in fisiere,
 # ca un mpv fals ramas in urma sa nu blocheze scriptul.
 cd "$(dirname "$0")/tests" || exit 1
-mkdir -p run; for n in "" 6 7 8 9 10 11 12 13 14; do mkdir -p "cache$n"; done   # foldere de lucru ale testelor (ignorate de git)
+mkdir -p run; for n in "" 6 7 8 9 10 11 12 13 14 16 17; do mkdir -p "cache$n"; done   # foldere de lucru ale testelor (ignorate de git)
 fail=0
 for t in test*.py; do
   timeout -k 5 280 python3 "$t" > "/tmp/agent-$t.out" 2>&1 < /dev/null; rc=$?

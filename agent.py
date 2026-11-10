@@ -111,10 +111,27 @@ def parse_entry(e):
     return {"file": name, "order": int(e.get("order", 0)), "secs": secs}
 
 
+def parse_schedule(raw):
+    """Programul de lucru: {zi ISO 1..7: (deschidere, inchidere)}. Zilele care lipsesc sunt inchise.
+    Forma noua: "schedule": [{"day": 1, "open": "10:00", "close": "18:00"}, ...] (inchiderea mai mica decat
+    deschiderea = trece peste miezul noptii). Forma veche (fara "schedule"): "open"/"close" unice, valabile in toate zilele."""
+    if raw.get("schedule") is None:
+        hours = (hhmm(raw["open"]), hhmm(raw["close"]))
+        return {day: hours for day in range(1, 8)}
+    if not isinstance(raw["schedule"], list):
+        raise ValueError("schedule invalid")
+    schedule = {}
+    for e in raw["schedule"]:
+        day = e["day"]
+        if not isinstance(day, int) or isinstance(day, bool) or not 1 <= day <= 7 or day in schedule:
+            raise ValueError("zi invalida in schedule: %r" % (day,))
+        schedule[day] = (hhmm(e["open"]), hhmm(e["close"]))
+    return schedule
+
+
 def parse_program(raw):
     """Valideaza programul JSON. Ridica ValueError/KeyError/TypeError daca e gresit."""
-    prog = {"open": hhmm(raw["open"]), "close": hhmm(raw["close"]), "default": [], "parties": [],
-            "stop_images": []}
+    prog = {"schedule": parse_schedule(raw), "default": [], "parties": [], "stop_images": []}
     # pozele de fundal: lista stopImages [{file, imageSeconds?}] sau, in forma veche, o singura poza stopImage
     if raw.get("stopImages"):
         prog["stop_images"] = [parse_entry(e) for e in raw["stopImages"]]
@@ -122,17 +139,28 @@ def parse_program(raw):
         prog["stop_images"] = [parse_entry({"file": raw["stopImage"]})]
     for e in raw.get("default", []):
         item = parse_entry(e)
-        item["days"] = e["days"]
-        if not item["days"] or not all(isinstance(d, int) and 1 <= d <= 7 for d in item["days"]):
-            raise ValueError("days invalid pentru %s" % item["file"])
+        if "days" in e:       # forma veche: zilele clipului; in forma noua clipurile ruleaza in toate zilele deschise
+            item["days"] = e["days"]
+            if not item["days"] or not all(isinstance(d, int) and 1 <= d <= 7 for d in item["days"]):
+                raise ValueError("days invalid pentru %s" % item["file"])
         prog["default"].append(item)
+    manual_counts = {}      # petreceri fara ora: numarate pe zi, pentru id-ul "YYYY-MM-DD #N"
     for p in raw.get("parties", []):
+        party_files = [parse_entry(e) for e in p["files"]]
+        if p.get("start") is None and p.get("durationMinutes") is None:
+            # fara ora de inceput si de sfarsit: nu porneste singura, doar manual (comanda "party")
+            datetime.strptime(p["date"], "%Y-%m-%d")
+            n = manual_counts.get(p["date"], 0) + 1
+            manual_counts[p["date"]] = n
+            prog["parties"].append({"id": "%s #%d" % (p["date"], n), "start": None, "end": None,
+                                    "files": party_files})
+            continue
         start = datetime.strptime(p["date"] + " " + hhmm(p["start"]), "%Y-%m-%d %H:%M")
         minutes = int(p["durationMinutes"])
         if minutes <= 0:
             raise ValueError("durationMinutes invalid")
-        prog["parties"].append({"start": start, "end": start + timedelta(minutes=minutes),
-                                "files": [parse_entry(e) for e in p["files"]]})
+        prog["parties"].append({"id": start.strftime("%Y-%m-%d %H:%M"), "start": start,
+                                "end": start + timedelta(minutes=minutes), "files": party_files})
     return prog
 
 
@@ -145,22 +173,29 @@ def by_order(items):
 
 
 def default_items(prog, now):
-    return by_order([i for i in prog["default"] if now.isoweekday() in i["days"]])
+    return by_order([i for i in prog["default"] if "days" not in i or now.isoweekday() in i["days"]])
 
 
 def is_open(prog, now):
+    """Deschis dupa programul zilei de azi; sau, dupa miezul noptii, dupa programul de ieri daca acela trecea peste miezul noptii."""
     t = now.strftime("%H:%M")
-    if prog["open"] <= prog["close"]:
-        return prog["open"] <= t < prog["close"]
-    return t >= prog["open"] or t < prog["close"]      # program peste miezul noptii
+    today = prog["schedule"].get(now.isoweekday())
+    if today:
+        opens, closes = today
+        if opens < closes and opens <= t < closes:
+            return True
+        if opens > closes and t >= opens:               # program peste miezul noptii: partea de dinainte de 24:00
+            return True
+    yesterday = prog["schedule"].get((now - timedelta(days=1)).isoweekday())
+    return bool(yesterday) and yesterday[0] > yesterday[1] and t < yesterday[1]   # partea de dupa miezul noptii
 
 
 def compute_target(prog, now):
     """(cheie, fisiere): petrecere activa > default in orele de functionare > nimic."""
-    active = [p for p in prog["parties"] if p["start"] <= now < p["end"]]
+    active = [p for p in prog["parties"] if p["start"] is not None and p["start"] <= now < p["end"]]
     if active:
         p = max(active, key=lambda x: x["start"])
-        return "party:" + p["start"].strftime("%Y-%m-%d %H:%M"), by_order(p["files"])
+        return "party:" + p["id"], by_order(p["files"])
     if is_open(prog, now):
         return "default", default_items(prog, now)
     return "none", []
@@ -191,6 +226,9 @@ def referenced_files(prog):
 class Player:
     def __init__(self):
         self.proc = None
+        self.entry_files = {}       # playlist_entry_id mpv -> numele fisierului (pentru erorile de redare)
+        self.error_seq = 0          # creste la fiecare eroare de redare raportata
+        self.last_error = None      # {"id", "file", "message"}: ultima eroare de redare, vizibila in /status
 
     def running(self):
         return self.proc is not None and self.proc.poll() is None
@@ -216,6 +254,10 @@ class Player:
                     if msg.get("request_id") == 1 and "error" in msg:  # sare peste evenimente
                         return msg
 
+    def idle(self):
+        """mpv ruleaza, dar nu mai reda nimic (ex. toate fisierele din playlist au dat eroare: mpv nu reia bucla)."""
+        return self.running() and self.prop("idle-active") is True
+
     def prop(self, name):
         try:
             return self.ipc("get_property", name).get("data")
@@ -233,10 +275,57 @@ class Player:
         cmd += cfg["mpv_args"]
         log.info("pornesc mpv: %s", " ".join(cmd))
         self.proc = subprocess.Popen(cmd)
+        self.entry_files = {}
         for _ in range(50):
             if os.path.exists(sock) or not self.running():
                 break
             time.sleep(0.1)
+        if os.path.exists(sock):
+            # conectarea se face aici, inainte sa se incarce primul fisier, ca prima eroare sa nu se piarda
+            try:
+                watcher = socket.socket(socket.AF_UNIX)
+                watcher.connect(sock)
+                threading.Thread(target=self.watch, args=(watcher,), daemon=True).start()
+            except OSError as e:
+                log.warning("nu pot urmari evenimentele mpv: %s", e)
+
+    def watch(self, s):
+        """Conexiunea permanenta la mpv (ruleaza in fir propriu, pana se inchide mpv): la evenimentul end-file cu
+        reason=error retine eroarea de redare, ca sa apara in /status."""
+        try:
+            with s:
+                for line in s.makefile("rb"):
+                    try:
+                        msg = json.loads(line)
+                    except ValueError:
+                        continue
+                    if msg.get("event") == "end-file" and msg.get("reason") == "error":
+                        self.report_error(msg)
+        except OSError as e:
+            log.warning("urmarirea evenimentelor mpv s-a oprit: %s", e)
+
+    def refresh_entries(self):
+        """Retine, pentru fiecare intrare din playlist-ul mpv, id-ul ei -> numele fisierului."""
+        count = self.prop("playlist/count")
+        if not isinstance(count, int):
+            return
+        for n in range(count):
+            entry_id = self.prop("playlist/%d/id" % n)
+            filename = self.prop("playlist/%d/filename" % n)
+            if isinstance(entry_id, int) and isinstance(filename, str):
+                self.entry_files[entry_id] = os.path.basename(filename)
+
+    def report_error(self, msg):
+        """Eroare de redare a unui fisier (end-file, reason=error). Fiecare aparitie primeste un id nou, chiar daca
+        e aceeasi eroare, ca Sellbit sa o poata afisa din nou dupa ce utilizatorul a apasat OK."""
+        entry_id = msg.get("playlist_entry_id")
+        if entry_id not in self.entry_files:
+            self.refresh_entries()
+        name = self.entry_files.get(entry_id)
+        text = msg.get("file_error") or "eroare necunoscuta"
+        self.error_seq += 1
+        self.last_error = {"id": self.error_seq, "file": name, "message": text}
+        log.error("eroare de redare (%s): %s", name or "fisier necunoscut", text)
 
     def stop(self):
         if not self.running():
@@ -257,6 +346,7 @@ class Player:
             if secs:
                 args.append("image-display-duration=%s" % secs)
             self.ipc(*args)
+        self.refresh_entries()
         self.ipc("set_property", "pause", False)
 
 
@@ -271,7 +361,7 @@ class Agent:
         self.player = Player()
         self.ssh = None
         self.manual = None      # None | "stop" | "pause" | "play" | "party"
-        self.party_session = None   # "YYYY-MM-DD HH:MM" al petrecerii pornite manual (se pastreaza peste pauza)
+        self.party_session = None   # id-ul petrecerii pornite manual ("YYYY-MM-DD HH:MM" sau "YYYY-MM-DD #N") (se pastreaza peste pauza)
         self.party_items = []       # fisierele ei: ultima versiune cunoscuta, ca sesiunea sa nu depinda de program
         self.adhoc_loading = False  # rularea rapida: se descarca fisiere care nu erau pe player
         self.adhoc_error = None     # motivul ultimului esec la descarcare
@@ -328,9 +418,10 @@ class Agent:
             self.player.stop()
 
     def find_party(self, prog, party_id):
-        """Petrecerea din program cu id-ul 'YYYY-MM-DD HH:MM' (data si ora de inceput), sau None."""
+        """Petrecerea din program cu id-ul dat, sau None. Id: 'YYYY-MM-DD HH:MM' (data si ora de inceput) sau,
+        pentru petrecerea fara ore, 'YYYY-MM-DD #N' (N = a cata petrecere fara ore din acea zi, in ordinea din program)."""
         for party in prog["parties"] if prog else []:
-            if party["start"].strftime("%Y-%m-%d %H:%M") == party_id:
+            if party["id"] == party_id:
                 return party
         return None
 
@@ -458,7 +549,7 @@ class Agent:
                 if not playlist:
                     return False, "fisierele petrecerii nu sunt pe player"
                 self.party_session, self.party_items, self.manual = arg, by_order(party["files"]), "party"
-                if playlist != self.playlist or not self.player.running():
+                if playlist != self.playlist or not self.player.running() or self.player.idle():
                     self.apply(playlist)
                 else:
                     self.player.ipc("set_property", "pause", False)
@@ -472,7 +563,7 @@ class Agent:
                     threading.Thread(target=self.fetch_adhoc, args=(missing,), daemon=True).start()
                     return True, "se descarca %d fisiere; porneste cand sunt gata" % len(missing)
                 playlist = self.to_playlist(arg)
-                if playlist != self.playlist or not self.player.running():
+                if playlist != self.playlist or not self.player.running() or self.player.idle():
                     self.apply(playlist)
                 else:
                     self.player.ipc("set_property", "pause", False)
@@ -512,7 +603,7 @@ class Agent:
                         self.manual = "play" if playlist else None
                     if not playlist:
                         return False, "nu exista clipuri de rulat"
-                    if playlist != self.playlist or not self.player.running():
+                    if playlist != self.playlist or not self.player.running() or self.player.idle():
                         self.apply(playlist)             # daca ruleaza deja exact asta, nu o reiau de la zero
         return True, "ok"
 
@@ -617,7 +708,8 @@ class Agent:
                 "paused": self.player.prop("pause") if running else None,
                 "playing": os.path.basename(playing) if isinstance(playing, str) else None,
                 "program_version": version, "free_mb": vfs.f_bavail * vfs.f_frsize // 2**20,
-                "syncing": self.sync_busy, "last_sync": self.last_sync}
+                "syncing": self.sync_busy, "last_sync": self.last_sync,
+                "playback_error": self.player.last_error}
 
 
 # ---------------------------------------------------------------- HTTP (doar loopback, prin tunel)
